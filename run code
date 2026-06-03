@@ -1,0 +1,598 @@
+#include <HardwareSerial.h>
+#include <ModbusRTU.h>
+
+// =========================
+// ====== PIN ASSIGNMENTS ===
+// =========================
+static const int SENS_RX = 16;
+static const int SENS_TX = 17;
+static const int TFT_RX  = 5;
+static const int TFT_TX  = 4;
+static const int PC_RX   = 26;
+static const int PC_TX   = 25;
+static const int LED_RED    = 12;
+static const int LED_GREEN  = 14;
+static const int LED_YELLOW = 27;
+
+// =========================
+// ======= UART OBJECTS =====
+// =========================
+HardwareSerial RS485_SENS(2);  // UART2 — Sensors + LUX
+HardwareSerial DWIN_UART(1);   // UART1 — DWIN Display
+HardwareSerial PC_UART(0);     // UART0 — PC Modbus Slave
+
+ModbusRTU mb;
+
+// =========================
+// ======= SETTINGS =========
+// =========================
+#define RX_TIMEOUT        500
+#define LUX_REG           54
+#define MODBUS_SLAVE_ID   1
+#define SENSOR_PERIOD_MS  400
+#define DISPLAY_PERIOD_MS 300
+
+// =========================
+// ===== MODBUS REGISTER MAP =
+// Holding Registers (FC03 / FC06)
+//
+// Sensor i  base = i * 6
+//   +0 = Voltage Hi    +1 = Voltage Lo
+//   +2 = Current Hi    +3 = Current Lo
+//   +4 = Power Hi      +5 = Power Lo
+//
+// i=0 Solar1  → reg  0– 5
+// i=1 Solar2  → reg  6–11
+// i=2 Solar3  → reg 12–17
+// i=3 Solar4  → reg 18–23
+// i=4 LED1    → reg 24–29
+// i=5 LED2    → reg 30–35
+// i=6 LED3    → reg 36–41
+// i=7 LED4    → reg 42–47
+// i=8 Battery → reg 48–53
+// LUX         → reg 54–55
+//
+// Special control registers (FC06 write from PC):
+// reg 60 = Page switch (PC writes 0-5 → ESP switches DWIN page)
+// reg 61 = Poll enable (PC writes 0 = pause, 1 = resume)
+// =========================
+uint16_t holdingRegs[70] = {0};
+
+// =========================
+// ======= LUX COMMAND ======
+// =========================
+static const uint8_t LuxCmd[8] = { 0x48, 0x03, 0x00, 0x02, 0x00, 0x02, 0x6B, 0x92 };
+float LUX = 0.0f;
+
+// =========================
+// ======= MUTEX ============
+// =========================
+SemaphoreHandle_t gLock = nullptr;
+
+// =========================
+// ===== SENSOR STRUCT ======
+// =========================
+struct SensorData {
+  uint8_t     slaveID;
+  const char* label;
+  float       voltage;
+  float       current;
+  float       power;
+  bool        valid;
+};
+
+// =========================
+// ===== SENSOR ARRAY =======
+// =========================
+SensorData sensors[9] = {
+  { 1, 0, 0, 0, false },
+  { 2, 0, 0, 0, false },
+  { 3, 0, 0, 0, false },
+  { 4, 0, 0, 0, false },
+  { 5, 0, 0, 0, false },
+  { 6, 0, 0, 0, false },
+  { 7, 0, 0, 0, false },
+  { 8, 0, 0, 0, false },
+  { 9, 0, 0, 0, false },
+};
+
+// =========================
+// ===== CONTROL FLAGS ======
+// Written by PC via FC06
+// =========================
+volatile bool pollEnabled = true;   // reg 61: PC can pause/resume polling
+
+// =========================
+// ========= CRC ============
+// =========================
+uint16_t modbusCRC(const uint8_t *buf, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (int i = 0; i < 8; i++) {
+      if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; }
+      else               { crc >>= 1; }
+    }
+  }
+  return crc;
+}
+
+static uint16_t CRC16_2(const uint8_t *buf, int len) {
+  uint16_t crc = 0xFFFF;
+  for (int pos = 0; pos < len; pos++) {
+    crc ^= (uint16_t)buf[pos];
+    for (int i = 0; i < 8; i++) {
+      if (crc & 0x0001) { crc >>= 1; crc ^= 0xA001; }
+      else               { crc >>= 1; }
+    }
+  }
+  crc = (uint16_t)((crc & 0x00FF) << 8) | (uint16_t)((crc & 0xFF00) >> 8);
+  return crc;
+}
+
+// =========================
+// ===== FLOAT HELPERS ======
+// =========================
+float regsToFloat(uint16_t hi, uint16_t lo) {
+  union { uint32_t i; float f; } u;
+  u.i = ((uint32_t)hi << 16) | lo;
+  return u.f;
+}
+
+void floatToRegs(float val, uint16_t &hi, uint16_t &lo) {
+  union { float f; uint32_t i; } u;
+  u.f = val;
+  hi = (u.i >> 16) & 0xFFFF;
+  lo =  u.i        & 0xFFFF;
+}
+
+void FloatToHex(float f, byte *hex) {
+  byte *f_byte = reinterpret_cast<byte *>(&f);
+  memcpy(hex, f_byte, 4);
+}
+
+// =========================
+// ===== READ HELPER ========
+// =========================
+static size_t readN(HardwareSerial &port, uint8_t *buf,
+                    size_t len, uint32_t timeoutMs = 500) {
+  size_t offset = 0;
+  uint32_t start = millis();
+  while (offset < len) {
+    if (port.available()) buf[offset++] = port.read();
+    if (millis() - start > timeoutMs) break;
+  }
+  return offset;
+}
+
+// =========================
+// ===== DWIN FUNCTIONS =====
+// =========================
+void dwinWriteFloat(uint16_t vpAddress, float floatValue) {
+  byte hex[4];
+  FloatToHex(floatValue, hex);
+
+  DWIN_UART.write(0x5A);
+  DWIN_UART.write(0xA5);
+  DWIN_UART.write(0x07);
+  DWIN_UART.write(0x82);
+  DWIN_UART.write(highByte(vpAddress));
+  DWIN_UART.write(lowByte(vpAddress));
+  DWIN_UART.write(hex[3]);   // Big-endian
+  DWIN_UART.write(hex[2]);
+  DWIN_UART.write(hex[1]);
+  DWIN_UART.write(hex[0]);
+}
+
+void dwinSwitchPage(uint8_t pageNum) {
+  DWIN_UART.write(0x5A);
+  DWIN_UART.write(0xA5);
+  DWIN_UART.write(0x06);
+  DWIN_UART.write(0x82);
+  DWIN_UART.write(0x00);
+  DWIN_UART.write(0x84);
+  DWIN_UART.write(0x00);
+  DWIN_UART.write(pageNum);
+  delay(50);
+}
+
+// =========================
+// === MODBUS FC06 CALLBACK =
+// Called by ModbusRTU library
+// whenever PC writes a single
+// holding register (FC06)
+// =========================
+uint16_t cbWriteHreg(TRegister *reg, uint16_t val) {
+  uint16_t regNum = reg->address.address;
+
+  if (regNum == 60) {
+    // PC requests page switch on DWIN
+    if (val <= 5) dwinSwitchPage((uint8_t)val);
+  }
+  else if (regNum == 61) {
+    // PC pauses (0) or resumes (1) sensor polling
+    pollEnabled = (val != 0);
+    Serial.printf("[Modbus] Poll %s by PC\n", pollEnabled ? "RESUMED" : "PAUSED");
+  }
+
+  return val; // Return value to confirm write
+}
+
+// =========================
+// ===== POLL SENSOR ========
+// =========================
+bool pollSensor(SensorData &s) {
+  uint8_t request[8] = {
+    s.slaveID, 0x03, // changes
+    0x00, 0x00,
+    0x00, 0x06, //changes
+    0x00, 0x00
+  };
+  uint16_t crc = modbusCRC(request, 6);
+  request[6] = crc & 0xFF;
+  request[7] = crc >> 8;
+
+  while (RS485_SENS.available()) RS485_SENS.read();
+  delay(3); // changes
+  RS485_SENS.write(request, 8);
+  RS485_SENS.flush();
+  delay(2); //changes
+
+  uint32_t t0 = millis();
+  while (RS485_SENS.available() < 17) {
+    if (millis() - t0 > 700) { s.valid = false; return false; } // changes
+    vTaskDelay(pdMS_TO_TICKS(2));
+  }
+
+  uint8_t response[17]; // changes
+  RS485_SENS.readBytes(response, 17); // changes
+  while (RS485_SENS.available()) RS485_SENS.read(); // changes 
+
+  if (response[0] != s.slaveID || response[1] != 0x03) { s.valid = false; return false; }
+
+  uint16_t rxCRC   = (response[16] << 8) | response[15];
+  uint16_t calcCRC = modbusCRC(response, 15);
+  if (rxCRC != calcCRC) 
+    { s.valid = false;
+  delay(15); // changes 
+  return false; }
+
+  
+  s.voltage = regsToFloat((response[3]  << 8) | response[4],  (response[5]  << 8) | response[6]);
+  s.current = regsToFloat((response[7]  << 8) | response[8],  (response[9]  << 8) | response[10]);
+  s.power   = regsToFloat((response[11] << 8) | response[12], (response[13] << 8) | response[14]);
+  s.valid   = true;
+  delay(15); // changes 
+  return true;
+}
+
+// =========================
+// ===== LUX SENSOR =========
+// =========================
+float readLuxYourWay() {
+  uint8_t Data[10] = {0};
+  uint8_t ch = 0;
+  float lux = 0.0f;
+
+  vTaskDelay(pdMS_TO_TICKS(100));
+  RS485_SENS.write(LuxCmd, 8);
+  vTaskDelay(pdMS_TO_TICKS(10));
+
+  if (readN(RS485_SENS, &ch, 1, 200) == 1 && ch == 0x48) {
+    Data[0] = ch;
+    if (readN(RS485_SENS, &ch, 1, 200) == 1 && ch == 0x03) {
+      Data[1] = ch;
+      if (readN(RS485_SENS, &ch, 1, 200) == 1 && ch == 0x04) {
+        Data[2] = ch;
+        if (readN(RS485_SENS, &Data[3], 6, 200) == 6) {
+          if (CRC16_2(Data, 7) == (uint16_t)Data[7] * 256 + Data[8]) {
+            lux = (Data[3] * 0x1000000UL +
+                   Data[4] * 0x10000UL   +
+                   Data[5] * 0x100UL     +
+                   Data[6]) / 1000.0f;
+          }
+        }
+      }
+    }
+  }
+  RS485_SENS.flush();
+  return lux;
+}
+
+// =========================
+// ===== UPDATE DISPLAY =====
+// =========================
+void updateDisplay() {
+  for (int i = 0; i < 9; i++) {
+    uint16_t base = 0x1000 + (i * 6);
+    dwinWriteFloat(base,     sensors[i].valid ? sensors[i].voltage : 0.0f);
+    dwinWriteFloat(base + 2, sensors[i].valid ? sensors[i].current : 0.0f);
+    dwinWriteFloat(base + 4, sensors[i].valid ? sensors[i].power   : 0.0f);
+  }
+  dwinWriteFloat(0x1036, LUX);
+}
+
+// =========================
+// ===== UPDATE DISPLAY =====
+// =========================
+// =========================
+// ===== LED STATUS =========
+// =========================
+void updateLEDStatus(){
+
+  int activeInputs = 0;   // sensors actually receiving signal
+  int okInputs     = 0;
+
+  bool polarityError = false;
+  bool wiringError   = false;
+  bool noLoad        = false;
+
+  for(int i=0;i<9;i++){
+
+    if(sensors[i].valid){
+
+      float v = sensors[i].voltage;
+      float iVal = sensors[i].current;
+      float p = sensors[i].power;
+
+      // ✅ ACTIVE INPUT CONDITION
+      if(v > 5.0){   // adjust threshold if needed
+
+        activeInputs++;
+
+        // 🔴 Reverse polarity
+        if(i != 8 && (v < 0 || iVal < 0)){
+          polarityError = true;
+        }
+
+        // 🟡 No load
+        else if(iVal < 0.02 && p < 1){
+          noLoad = true;
+        }
+
+        // 🔴 Wrong wiring
+        else if(iVal < 0.01){
+          wiringError = true;
+        }
+
+        else{
+          okInputs++;
+        }
+      }
+    }
+  }
+
+  // 🔴 No active input at all
+  if(activeInputs == 0){
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, LOW);
+    return;
+  }
+
+  // 🔴 Reverse polarity
+  if(polarityError){
+    digitalWrite(LED_RED, millis()%500 < 250);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, LOW);
+    return;
+  }
+
+  // 🔴 Wrong wiring
+  if(wiringError){
+    digitalWrite(LED_RED, HIGH);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, millis()%500 < 250);
+    return;
+  }
+
+  // 🟡 No load
+  if(noLoad){
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, HIGH);
+    return;
+  }
+
+  // 🟢 All active inputs OK
+  if(okInputs == activeInputs){
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_YELLOW, LOW);
+  }
+  else{
+    digitalWrite(LED_RED, LOW);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_YELLOW, HIGH);
+  }
+}
+
+// =========================
+// ===== TASK: SENSORS ======
+// Core 0
+// =========================
+void taskSensors(void *pv) {
+  (void)pv;
+  static bool firstRun = true; // changes
+  while (1) {
+    // ✅ RUN ONLY ONCE AT START
+  if (firstRun) {
+    vTaskDelay(pdMS_TO_TICKS(300));
+    firstRun = false;
+  }
+    if (!pollEnabled) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    // ✅ FIX: first dummy poll (ignored)
+  pollSensor(sensors[0]);
+  vTaskDelay(pdMS_TO_TICKS(100));
+
+
+    // Poll 9 power sensors
+    for (int i = 0; i < 9; i++) {
+      pollSensor(sensors[i]);
+      vTaskDelay(pdMS_TO_TICKS(350)); // changes
+    }
+    // ✅ LED here
+    updateLEDStatus();
+
+
+    // Poll LUX
+    LUX = readLuxYourWay(); //temporary check 
+
+    // Update holding registers (mutex protected)
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(80)) == pdTRUE) {
+      for (int i = 0; i < 9; i++) {
+        int base = i * 6;
+        floatToRegs(sensors[i].voltage, holdingRegs[base],     holdingRegs[base + 1]);
+        floatToRegs(sensors[i].current, holdingRegs[base + 2], holdingRegs[base + 3]);
+        floatToRegs(sensors[i].power,   holdingRegs[base + 4], holdingRegs[base + 5]);
+        mb.Hreg(base,     holdingRegs[base]);
+        mb.Hreg(base + 1, holdingRegs[base + 1]);
+        mb.Hreg(base + 2, holdingRegs[base + 2]);
+        mb.Hreg(base + 3, holdingRegs[base + 3]);
+        mb.Hreg(base + 4, holdingRegs[base + 4]);
+        mb.Hreg(base + 5, holdingRegs[base + 5]);
+      }
+      // LUX (outside loop)
+      floatToRegs(LUX, holdingRegs[LUX_REG], holdingRegs[LUX_REG + 1]);
+      mb.Hreg(LUX_REG,     holdingRegs[LUX_REG]);
+      mb.Hreg(LUX_REG + 1, holdingRegs[LUX_REG + 1]);
+      xSemaphoreGive(gLock);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(400));
+  }
+}
+
+// =========================
+// ===== TASK: DISPLAY ======
+// Core 1
+// =========================
+void taskDisplay(void *pv) {
+  (void)pv;
+  while (1) {
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(10)) == pdTRUE) {
+      updateDisplay();
+      xSemaphoreGive(gLock);
+    }
+    vTaskDelay(pdMS_TO_TICKS(DISPLAY_PERIOD_MS));
+  }
+}
+
+// =========================
+// ===== TASK: MODBUS =======
+// Core 1 — Pure slave mode
+// Only responds when PC asks
+// =========================
+void taskModbus(void *pv) {
+  (void)pv;
+  mb.begin(&PC_UART, 9600);
+  mb.slave(MODBUS_SLAVE_ID);
+
+  // Register all 70 holding registers (FC03 read)
+  for (int i = 0; i < 70; i++) mb.addHreg(i, 0);
+
+  // Attach FC06 write callback on control registers
+  mb.onSetHreg(60, cbWriteHreg);   // Page switch
+  mb.onSetHreg(61, cbWriteHreg);   // Poll enable/disable
+
+  while (1) {
+    mb.task();  // Handles FC03 + FC06 automatically — only on PC request
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// =========================
+// ===== TASK: SERIAL OUT ===
+// Core 1
+// =========================
+void taskSerial(void *pv) {
+  (void)pv;
+  while (1) {
+    if (xSemaphoreTake(gLock, pdMS_TO_TICKS(80)) == pdTRUE) {
+
+      Serial.println("\n╔══════════════════════════════════════════════════════════════╗");
+      Serial.println("║              SOLAR SYSTEM TEST KIT — LIVE DATA              ║");
+      Serial.println("╚══════════════════════════════════════════════════════════════╝");
+
+      float totalSolar = 0;
+      Serial.println("\n  ┌─ SOLAR PANELS ───────────────────────────────────────────┐");
+      for (int i = 0; i < 4; i++) {
+        Serial.printf("  %-16s | ", sensors[i].label);
+        if (sensors[i].valid) {
+          Serial.printf("V:%7.3f V  I:%7.3f A  P:%8.3f W\n",
+                        sensors[i].voltage, sensors[i].current, sensors[i].power);
+          totalSolar += sensors[i].power;
+        } else { Serial.println("-- NO RESPONSE --"); }
+      }
+      Serial.printf("  └─ Total Solar : %.3f W\n", totalSolar);
+
+      float totalLED = 0;
+      Serial.println("\n  ┌─ LED LOADS ──────────────────────────────────────────────┐");
+      for (int i = 4; i < 8; i++) {
+        Serial.printf("  %-16s | ", sensors[i].label);
+        if (sensors[i].valid) {
+          Serial.printf("V:%7.3f V  I:%7.3f A  P:%8.3f W\n",
+                        sensors[i].voltage, sensors[i].current, sensors[i].power);
+          totalLED += sensors[i].power;
+        } else { Serial.println("-- NO RESPONSE --"); }
+      }
+      Serial.printf("  └─ Total LED   : %.3f W\n", totalLED);
+
+      Serial.println("\n  ┌─ BATTERY ────────────────────────────────────────────────┐");
+      Serial.printf("  %-16s | ", sensors[8].label);
+      if (sensors[8].valid) {
+        Serial.printf("V:%7.3f V  I:%7.3f A  P:%8.3f W\n",
+                      sensors[8].voltage, sensors[8].current, sensors[8].power);
+      } else { Serial.println("-- NO RESPONSE --"); }
+
+      float net = totalSolar - totalLED;
+      Serial.println("\n  ┌─ SYSTEM SUMMARY ─────────────────────────────────────────┐");
+      Serial.printf("  │  Solar    : %8.3f W\n", totalSolar);
+      Serial.printf("  │  LED      : %8.3f W\n", totalLED);
+      Serial.printf("  │  Net      : %8.3f W  (%s)\n",
+                    net, net >= 0 ? "Charging" : "Discharging");
+      Serial.printf("  │  LUX      : %8.3f lx\n", LUX);
+      Serial.printf("  │  Polling  : %s\n", pollEnabled ? "ACTIVE" : "PAUSED by PC");
+      Serial.println("  └──────────────────────────────────────────────────────────┘\n");
+
+      xSemaphoreGive(gLock);
+    }
+    vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+}
+
+// =========================
+// ========== SETUP =========
+// =========================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("BOOT: Solar System Test Kit");
+
+  gLock = xSemaphoreCreateMutex();
+
+  RS485_SENS.begin(9600,  SERIAL_8N1, SENS_RX, SENS_TX); //changes
+  DWIN_UART.begin(115200, SERIAL_8N1, TFT_RX,  TFT_TX);
+  PC_UART.begin(9600,     SERIAL_8N1, PC_RX,   PC_TX);
+
+  pinMode(LED_RED, OUTPUT);
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_YELLOW, OUTPUT);
+
+  digitalWrite(LED_RED, LOW);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_YELLOW, LOW);
+
+  xTaskCreatePinnedToCore(taskSensors, "Sensors", 8192, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(taskDisplay, "Display", 6144, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(taskModbus,  "Modbus",  6144, NULL, 2, NULL, 1);
+  //xTaskCreatePinnedToCore(taskSerial,  "Serial",  4096, NULL, 1, NULL, 1);
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1000));
+} 
